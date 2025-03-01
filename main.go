@@ -81,8 +81,12 @@ func main() {
 					panic("Failed to mark user as removed: " + err.Error())
 				}
 
-				// If the user is removed we still can fetch the events using the anonymous client.
+				// If the user is removed, we can still fetch the events using the anonymous client.
 				// Perhaps it's a GitHub bug, but it's a good thing for us.
+				//
+				// We can open the following URLs in a browser without any authentication:
+				// 	https://api.github.com/users/ultimatepate/events
+				// 	https://api.github.com/users/ultimatepate/received_events
 				client = anonymousGHClient
 			}
 
