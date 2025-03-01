@@ -1,6 +1,6 @@
-# botnet-detector
+# botnet-searcher
 
-A program to detect all bot users from the article ["Found a group of malicious Go projects injected with trojan"](https://alexandear.github.io/posts/2025-02-28-malicious-go-programs/).
+A program to search GitHub bot users from the article ["Found a group of malicious Go projects injected with trojan"](https://alexandear.github.io/posts/2025-02-28-malicious-go-programs/).
 
 ## Running Locally
 
