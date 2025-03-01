@@ -59,109 +59,123 @@ func main() {
 		panic("Failed to create table: " + err.Error())
 	}
 
+	// Insert initial seed users that are known to be malicious
 	_, err = db.Exec(`INSERT OR IGNORE INTO malicious_users (user) VALUES ('lazysmock'), ('unkemptdefe'), ('ultimatepate')`)
 	if err != nil {
 		panic("Failed to insert initial users: " + err.Error())
 	}
 
-	rows, err := db.Query(`SELECT id, user FROM malicious_users WHERE is_processed = FALSE`)
+	unprocessedUsers, err := retrieveUnprocessedUsers(db)
 	if err != nil {
-		panic("Failed to fetch users: " + err.Error())
-	}
-	defer rows.Close()
-
-	type User struct {
-		ID   int
-		Name string
+		panic("Failed to retrieve unprocessed users: " + err.Error())
 	}
 
-	nonProcessedUsers := map[User]struct{}{}
-	for rows.Next() {
-		var dbUser User
-		if err := rows.Scan(&dbUser.ID, &dbUser.Name); err != nil {
-			panic("Failed to scan user: " + err.Error())
-		}
+	for len(unprocessedUsers) > 0 {
+		for user := range unprocessedUsers {
+			client := ghClient
+			userNotFound := isGitHubUserNotFound(client, user.Name)
+			if userNotFound {
+				fmt.Printf("User https://github.com/%s is removed\n", user.Name)
 
-		nonProcessedUsers[dbUser] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		panic("Failed to iterate over rows: " + err.Error())
-	}
+				if _, err := db.Exec(`UPDATE malicious_users SET is_removed = TRUE WHERE id = ?`, user.ID); err != nil {
+					panic("Failed to mark user as removed: " + err.Error())
+				}
 
-	if err := rows.Close(); err != nil {
-		panic("Failed to close rows: " + err.Error())
-	}
-
-	for user := range nonProcessedUsers {
-		client := ghClient
-		if checkUserIsRemoved(client, user.Name) {
-			fmt.Printf("User https://github.com/%s is removed\n", user.Name)
-
-			if _, err := db.Exec(`UPDATE malicious_users SET is_removed = TRUE WHERE id = ?`, user.ID); err != nil {
-				panic("Failed to mark user as removed: " + err.Error())
-			}
-
-			if false {
 				// If the user is removed we still can fetch the events using the anonymous client.
 				// Perhaps it's a GitHub bug, but it's a good thing for us.
 				client = anonymousGHClient
 			}
+
+			fmt.Printf("Fetching events for user https://github.com/%s\n", user.Name)
+			ev, err := retrieveMaliciousUserEvents(client, user.Name)
+			// If userNotFound we probably getting 403 API rate limit of 60 exceeded.
+			// Ignore the error in this case.
+			if err != nil && !userNotFound {
+				fmt.Printf("Failed to fetch events for %v: %v\n", user, err)
+			}
+
+			if len(ev.CreatedRepositories) > 0 {
+				fmt.Printf("Inserting %d created repositories for user https://github.com/%s\n", len(ev.CreatedRepositories), user.Name)
+
+				for repo := range ev.CreatedRepositories {
+					if _, err := db.Exec("INSERT OR IGNORE INTO malicious_repositories (repository, user_id, is_fork) VALUES (?, ?, ?)", repo, user.ID, false); err != nil {
+						panic("Failed to insert created repository: " + err.Error())
+					}
+				}
+			}
+
+			if len(ev.ForkedRepositories) > 0 {
+				fmt.Printf("Inserting %d forked repositories for user: https://github.com/%s\n", len(ev.ForkedRepositories), user.Name)
+
+				for repo := range ev.ForkedRepositories {
+					if _, err := db.Exec("INSERT OR IGNORE INTO malicious_repositories (repository, user_id, is_fork) VALUES (?, ?, ?)", repo, user.ID, true); err != nil {
+						panic("Failed to insert forked repository: " + err.Error())
+					}
+				}
+			}
+
+			if len(ev.RealUsers) > 0 {
+				fmt.Printf("Removing %d real users for user: %s\n", len(ev.RealUsers), user.Name)
+
+				for realUser := range ev.RealUsers {
+					if _, err := db.Exec("DELETE FROM malicious_users WHERE user = ?", realUser); err != nil {
+						panic("Failed to delete real user: " + err.Error())
+					}
+				}
+			}
+
+			if len(ev.BotUsers) > 0 {
+				fmt.Printf("Inserting %d watched users for user: https://github.com/%s\n", len(ev.BotUsers), user.Name)
+
+				for watchedUser := range ev.BotUsers {
+					if _, err := db.Exec("INSERT OR IGNORE INTO malicious_users (user) VALUES (?)", watchedUser); err != nil {
+						panic("Failed to insert watched user: " + err.Error())
+					}
+				}
+			}
+
+			if _, err := db.Exec(`UPDATE malicious_users SET is_processed = TRUE WHERE id = ?`, user.ID); err != nil {
+				panic("Failed to update user: " + err.Error())
+			}
 		}
 
-		fmt.Printf("Fetching events for user https://github.com/%s\n", user.Name)
-		ev, err := retrieveMaliciousUserEvents(client, user.Name)
+		unprocessedUsers, err = retrieveUnprocessedUsers(db)
 		if err != nil {
-			fmt.Printf("Failed to fetch events for %v: %v\n", user, err)
-			continue
-		}
-
-		if len(ev.CreatedRepositories) > 0 {
-			fmt.Printf("Inserting %d created repositories for user https://github.com/%s\n", len(ev.CreatedRepositories), user.Name)
-
-			for repo := range ev.CreatedRepositories {
-				if _, err := db.Exec("INSERT OR IGNORE INTO malicious_repositories (repository, user_id, is_fork) VALUES (?, ?, ?)", repo, user.ID, false); err != nil {
-					panic("Failed to insert created repository: " + err.Error())
-				}
-			}
-		}
-
-		if len(ev.ForkedRepositories) > 0 {
-			fmt.Printf("Inserting %d forked repositories for user: https://github.com/%s\n", len(ev.ForkedRepositories), user.Name)
-
-			for repo := range ev.ForkedRepositories {
-				if _, err := db.Exec("INSERT OR IGNORE INTO malicious_repositories (repository, user_id, is_fork) VALUES (?, ?, ?)", repo, user.ID, true); err != nil {
-					panic("Failed to insert forked repository: " + err.Error())
-				}
-			}
-		}
-
-		if len(ev.RealUsers) > 0 {
-			fmt.Printf("Removing %d real users for user: %s\n", len(ev.RealUsers), user.Name)
-
-			for realUser := range ev.RealUsers {
-				if _, err := db.Exec("DELETE FROM malicious_users WHERE user = ?", realUser); err != nil {
-					panic("Failed to delete real user: " + err.Error())
-				}
-			}
-		}
-
-		if len(ev.BotUsers) > 0 {
-			fmt.Printf("Inserting %d watched users for user: https://github.com/%s\n", len(ev.BotUsers), user.Name)
-
-			for watchedUser := range ev.BotUsers {
-				if _, err := db.Exec("INSERT OR IGNORE INTO malicious_users (user) VALUES (?)", watchedUser); err != nil {
-					panic("Failed to insert watched user: " + err.Error())
-				}
-			}
-		}
-
-		if _, err := db.Exec(`UPDATE malicious_users SET is_processed = TRUE WHERE id = ?`, user.ID); err != nil {
-			panic("Failed to update user: " + err.Error())
+			panic("Failed to retrieve unprocessed users: " + err.Error())
 		}
 	}
 }
 
-func checkUserIsRemoved(client *github.Client, user string) bool {
+type dbUser struct {
+	ID   int
+	Name string
+}
+
+func retrieveUnprocessedUsers(db *sql.DB) (map[dbUser]struct{}, error) {
+	rows, err := db.Query(`SELECT id, user FROM malicious_users WHERE is_processed = FALSE`)
+	if err != nil {
+		return nil, fmt.Errorf("query users: %w", err)
+	}
+	defer rows.Close()
+
+	users := map[dbUser]struct{}{}
+	for i := 0; rows.Next(); i++ {
+		var dbUser dbUser
+		if err := rows.Scan(&dbUser.ID, &dbUser.Name); err != nil {
+			return nil, fmt.Errorf("scan user %d: %w", i, err)
+		}
+		users[dbUser] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate over rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close rows: %w", err)
+	}
+	return users, nil
+}
+
+func isGitHubUserNotFound(client *github.Client, user string) bool {
 	_, resp, err := client.Users.Get(context.Background(), user)
 	if resp != nil && resp.StatusCode == http.StatusNotFound {
 		return true
@@ -173,15 +187,15 @@ func checkUserIsRemoved(client *github.Client, user string) bool {
 	return false
 }
 
-type Event struct {
+type ghEvent struct {
 	CreatedRepositories map[string]struct{}
 	ForkedRepositories  map[string]struct{}
 	BotUsers            map[string]struct{}
 	RealUsers           map[string]struct{}
 }
 
-func newEvent() Event {
-	return Event{
+func newGHEvent() ghEvent {
+	return ghEvent{
 		CreatedRepositories: map[string]struct{}{},
 		ForkedRepositories:  map[string]struct{}{},
 		BotUsers:            map[string]struct{}{},
@@ -189,19 +203,19 @@ func newEvent() Event {
 	}
 }
 
-func retrieveMaliciousUserEvents(client *github.Client, user string) (Event, error) {
+func retrieveMaliciousUserEvents(client *github.Client, user string) (ghEvent, error) {
 	ctx := context.Background()
 	performedEvents, _, err := client.Activity.ListEventsPerformedByUser(ctx, user, true, nil)
 	if err != nil {
-		return Event{}, fmt.Errorf("fetching events: %w", err)
+		return ghEvent{}, fmt.Errorf("fetching events: %w", err)
 	}
 
 	receivedEvents, _, err := client.Activity.ListEventsReceivedByUser(ctx, user, true, nil)
 	if err != nil {
-		return Event{}, fmt.Errorf("fetching events: %w", err)
+		return ghEvent{}, fmt.Errorf("fetching events: %w", err)
 	}
 
-	ev := newEvent()
+	ev := newGHEvent()
 	for _, event := range slices.Concat(performedEvents, receivedEvents) {
 		if event.Type == nil {
 			continue
