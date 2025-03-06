@@ -52,6 +52,7 @@ func main() {
 		repository TEXT NOT NULL,
 		user_id INTEGER NOT NULL,
 		is_fork INT NOT NULL DEFAULT FALSE,
+		is_processed INT NOT NULL DEFAULT FALSE,
 		FOREIGN KEY(user_id) REFERENCES malicious_users(id),
 		UNIQUE(repository, user_id)
 		)`)
@@ -148,6 +149,43 @@ func main() {
 			panic("Failed to retrieve unprocessed users: " + err.Error())
 		}
 	}
+
+	unprocessedRepos, err := retrieveUnprocessedRepos(db)
+	if err != nil {
+		panic("Failed to retrieve unprocessed repositories: " + err.Error())
+	}
+
+	fmt.Println(unprocessedRepos)
+	for len(unprocessedRepos) > 0 {
+		for repo := range unprocessedRepos {
+			fmt.Printf("Fetching forks for repo https://github.com/%s/%s\n", repo.Owner, repo.Name)
+
+			forks, _, err := ghClient.Repositories.ListForks(context.Background(), repo.Owner, repo.Name, nil)
+			if err != nil {
+				fmt.Printf("Failed to fetch forks for https://github.com/%s/%s: %v\n", repo.Owner, repo.Name, err)
+			} else if len(forks) > 0 {
+				fmt.Printf("Inserting %d forked repositories for repo http://github.com/%s/%s", len(forks), repo.Owner, repo.Name)
+
+				for _, fork := range forks {
+					if _, err := db.Exec("INSERT OR IGNORE INTO malicious_repositories (repository, user_id, is_fork) VALUES (?, ?, ?)", *fork.FullName, repo.Owner, true); err != nil {
+						panic("Failed to insert forked repository: " + err.Error())
+					}
+					if _, err := db.Exec("INSERT OR IGNORE INTO malicious_users (user) VALUES (?)", *fork.Owner.Login); err != nil {
+						panic("Failed to insert forked user: " + err.Error())
+					}
+				}
+			}
+
+			if _, err := db.Exec(`UPDATE malicious_repositories SET is_processed = TRUE WHERE id = ?`, repo.ID); err != nil {
+				panic("Failed to update user: " + err.Error())
+			}
+		}
+
+		unprocessedRepos, err = retrieveUnprocessedRepos(db)
+		if err != nil {
+			panic("Failed to retrieve unprocessed repositories: " + err.Error())
+		}
+	}
 }
 
 type dbUser struct {
@@ -177,6 +215,40 @@ func retrieveUnprocessedUsers(db *sql.DB) (map[dbUser]struct{}, error) {
 		return nil, fmt.Errorf("close rows: %w", err)
 	}
 	return users, nil
+}
+
+type dbRepo struct {
+	ID    int
+	Owner string
+	Name  string
+}
+
+func retrieveUnprocessedRepos(db *sql.DB) (map[dbRepo]struct{}, error) {
+	rows, err := db.Query(`
+	SELECT mr.id, user, repository FROM malicious_repositories mr
+	JOIN malicious_users mu ON mu.id = mr.user_id
+	WHERE mr.is_processed = FALSE AND mr.is_fork = FALSE
+`)
+	if err != nil {
+		return nil, fmt.Errorf("query repositories: %w", err)
+	}
+	defer rows.Close()
+
+	repos := map[dbRepo]struct{}{}
+	for i := 0; rows.Next(); i++ {
+		var dbRepo dbRepo
+		if err := rows.Scan(&dbRepo.ID, &dbRepo.Owner, &dbRepo.Name); err != nil {
+			return nil, fmt.Errorf("scan repo %d: %w", i, err)
+		}
+		repos[dbRepo] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate over rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close rows: %w", err)
+	}
+	return repos, nil
 }
 
 func isGitHubUserNotFound(client *github.Client, user string) bool {
